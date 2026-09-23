@@ -6,6 +6,8 @@ using namespace std;
 #include "ADCInternal.h"
 #include "Blinker.h"
 #include "JSONMsgRouter.h"
+#include "FlightController.h"
+#include "pico/bootrom.h"
 #include "SubsystemCopilotControl.h"
 #include "SubsystemGps.h"
 #include "SubsystemTx.h"
@@ -32,6 +34,12 @@ TestConfiguration testCfg;
 
 // special convenience setting to switch to separately-released build
 static const bool API_MODE_BUILD = false;
+
+// Keep GPS powered between transmissions so the flight controller gets
+// fixes every second instead of once per 10-minute window.
+// Costs roughly the GPS module's run current for the non-transmitting part
+// of each window.
+static const bool FC_GPS_ON_BETWEEN_TX = true;
 
 class Application
 {
@@ -102,6 +110,13 @@ public:
             });
             timerWatchdog_.TimeoutIntervalMs(2'000, 0);
         }
+
+        // Restart the flight controller core if it stalls
+        timerFcSupervise_.SetName("TIMER_FC_SUPERVISE");
+        timerFcSupervise_.SetCallback([]{
+            FcSupervise();
+        });
+        timerFcSupervise_.TimeoutIntervalMs(2'000, 0);
 
         // set up blinker
         blinker_.SetPin(pinLedGreen_);
@@ -343,7 +358,19 @@ public:
             scheduler.OnGps3DPlusLock(fix3dPlus_);
         }, { .argCount = 0, .help = "trigger 3d lock"});
 
+        ssGps_.SetCallbackOnEveryFix3DPlus([](const Fix3DPlus &fix){
+            FcPublishGps({
+                .latE6     = fix.latDegMillionths,
+                .lngE6     = fix.lngDegMillionths,
+                .altM      = fix.altitudeM,
+                .courseDeg = (uint16_t)fix.courseDegrees,
+                .speedKph  = (uint16_t)fix.speedKph,
+            });
+        });
+
         scheduler.SetCallbackRequestNewGpsLock([this, &scheduler]{
+            gpsOnBetweenTx_ = false;
+
             BlinkerGpsSearch();
 
             t_.Reset();
@@ -403,8 +430,17 @@ public:
             // indicate idle state
             BlinkerIdle();
 
-            // shut off gps
-            ssGps_.Disable();
+            if (FC_GPS_ON_BETWEEN_TX)
+            {
+                // keep gps on, feeding the flight controller, until the radio warms up
+                ssGps_.StartContinuousFix3DPlus();
+                gpsOnBetweenTx_ = true;
+            }
+            else
+            {
+                // shut off gps
+                ssGps_.Disable();
+            }
         });
     }
 
@@ -441,6 +477,13 @@ public:
         });
 
         scheduler.SetCallbackStartRadioWarmup([this]{
+            // gps and tx never run at the same time
+            if (gpsOnBetweenTx_)
+            {
+                ssGps_.Disable();
+                gpsOnBetweenTx_ = false;
+            }
+
             ssTx_.Enable();
             ssTx_.RadioOn();
             ssTx_.SetupTransmitterForFlight();
@@ -480,11 +523,11 @@ public:
         auto &scheduler = ssCc_.GetScheduler();
 
         scheduler.SetCallbackGoHighSpeed([this]{
-            Clock::SetClockMHz(48);
+            SetClockMHz(48);
         });
 
         scheduler.SetCallbackGoLowSpeed([this]{
-            Clock::SetClockMHz(6);
+            SetClockMHz(6);
         });
     }
 
@@ -751,7 +794,7 @@ private:
         // 5mA baseline
         // takes ~10ms to accomplish
         Log("Drop to 6MHz clock speed");
-        Clock::SetClockMHz(6);
+        SetClockMHz(6);
         LogNL();
 
         if (testCfg.enabled)
@@ -766,7 +809,7 @@ private:
         PeripheralControl::DisablePeripheralList({
             PeripheralControl::SPI1,
             PeripheralControl::SPI0,
-            PeripheralControl::PWM,
+            // PWM left on, flight controller servo uses it
             PeripheralControl::PIO1,
             PeripheralControl::PIO0,
         });
@@ -777,11 +820,11 @@ private:
         // just because.        
         USB::SetCallbackVbusConnected([]{
             Log("App VBUS HIGH handler, switching to 48MHz");
-            Clock::SetClockMHz(48);
+            SetClockMHz(48);
         });
         USB::SetCallbackVbusDisconnected([]{
             Log("App VBUS LOW handler, switching to 6MHz");
-            Clock::SetClockMHz(6);
+            SetClockMHz(6);
         });
         USB::EnablePowerSaveMode();
         LogNL();
@@ -852,6 +895,28 @@ private:
         Shell::AddCommand("app.show", [this](vector<string> argList){
             show = !show;
         }, { .argCount = 0, .help = ""});
+
+        Shell::AddCommand("servo.angle", [this](vector<string> argList){
+            float angle = strtof(argList[0].c_str(), nullptr);
+            if (FcSetServoAngle(angle))
+            {
+                Log("Servo set to ", angle, " degrees");
+            }
+            else
+            {
+                Log("Invalid angle");
+            }
+        }, { .argCount = 1, .help = "set servo angle <0-180>" });
+
+        Shell::AddCommand("fc.status", [this](vector<string> argList){
+            FcStatus status = FcGetStatus();
+            Log("ticks       : ", status.ticks);
+            Log("restarts    : ", FcGetRestartCount());
+            Log("gps seq     : ", status.gpsSeqUsed);
+            Log("gps age ms  : ", status.gpsAgeMs);
+            Log("servo cdeg  : ", status.servoAngleCentiDeg);
+            Log("gps on btw  : ", gpsOnBetweenTx_);
+        }, { .argCount = 0, .help = "flight controller status" });
     }
 
     void SetupJSON()
@@ -863,6 +928,12 @@ private:
         router_.SetOnReceiveCallback([this](const string &jsonStr){
             UartTarget target(UART::UART_USB);
             Log(jsonStr);
+        });
+
+        // Reboot into the UF2 bootloader so new firmware can be copied on
+        // without holding BOOTSEL.
+        JSONMsgRouter::RegisterHandler("REQ_REBOOT_BOOTSEL", [this](auto &in, auto &out){
+            reset_usb_boot(0, 0);
         });
 
         JSONMsgRouter::RegisterHandler("REQ_GET_DEVICE_INFO", [this](auto &in, auto &out){
@@ -882,7 +953,15 @@ private:
 
 private:
 
+    // Keeps the flight controller's servo PWM correct across clock changes.
+    static void SetClockMHz(double mhz)
+    {
+        Clock::SetClockMHz(mhz);
+        FcOnClockChange();
+    }
+
     bool configurationMode_ = false;
+    bool gpsOnBetweenTx_ = false;
 
     Pin pinLedGreen_ = { 25 };
 
@@ -898,6 +977,7 @@ private:
 
     Timer timerStartupRole_;
     Timer timerWatchdog_;
+    Timer timerFcSupervise_;
     Timer timerGpsLockOrDie_;
 
     Blinker blinker_;

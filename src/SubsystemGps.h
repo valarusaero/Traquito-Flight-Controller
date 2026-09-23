@@ -90,6 +90,8 @@ public:
             gpsReader_.UnSetCallbackOnFix2D();
         });
         gpsReader_.SetCallbackOnFix3DPlus([=, this](const Fix3DPlus &fix){
+            fnCbOnEveryFix3DPlus_(fix);
+
             ++count;
 
             // let a few locks go by, hopefully bringing figures closer to
@@ -110,6 +112,22 @@ public:
     void CancelNewFix3DPlus()
     {
         gpsReader_.UnSetCallbackOnFix3DPlus();
+    }
+
+    // Called on every Fix3DPlus seen, both during a RequestNewFixTimeAnd3DPlus
+    // and in continuous mode.
+    void SetCallbackOnEveryFix3DPlus(function<void(const Fix3DPlus &)> fn)
+    {
+        fnCbOnEveryFix3DPlus_ = fn;
+    }
+
+    // Keep reporting every Fix3DPlus until Disable() or a new request.
+    // Module must already be enabled.
+    void StartContinuousFix3DPlus()
+    {
+        gpsReader_.SetCallbackOnFix3DPlus([this](const Fix3DPlus &fix){
+            fnCbOnEveryFix3DPlus_(fix);
+        });
     }
 
     void EnterMonitorMode()
@@ -547,4 +565,6 @@ private:
 
     GPSReader gpsReader_;
     GPSWriter gpsWriter_;
+
+    function<void(const Fix3DPlus &)> fnCbOnEveryFix3DPlus_ = [](const Fix3DPlus &){};
 };
